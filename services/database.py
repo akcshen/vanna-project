@@ -5,6 +5,8 @@ import re
 import sqlite3
 from typing import List, Optional
 
+import pandas as pd
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -58,6 +60,116 @@ def get_mysql_tables_filter() -> Optional[List[str]]:
     if not raw:
         return None
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+_mysql_conn = None
+_sqlite_conn = None
+
+
+def reset_db_connection() -> None:
+    """关闭并清空缓存的数据库连接，下次查询时自动重建。"""
+    global _mysql_conn, _sqlite_conn
+
+    if _mysql_conn is not None:
+        try:
+            _mysql_conn.close()
+        except Exception:
+            pass
+        _mysql_conn = None
+
+    if _sqlite_conn is not None:
+        try:
+            _sqlite_conn.close()
+        except Exception:
+            pass
+        _sqlite_conn = None
+
+
+def _create_mysql_connection():
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("请先安装 PyMySQL: pip install PyMySQL") from exc
+
+    cfg = get_mysql_config()
+    return pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        charset="utf8mb4",
+        connect_timeout=30,
+        read_timeout=120,
+        write_timeout=120,
+        autocommit=True,
+    )
+
+
+def _get_mysql_connection():
+    global _mysql_conn
+    if _mysql_conn is None:
+        _mysql_conn = _create_mysql_connection()
+    return _mysql_conn
+
+
+def _get_sqlite_connection():
+    global _sqlite_conn
+    if _sqlite_conn is None:
+        _sqlite_conn = sqlite3.connect(get_sqlite_path(), check_same_thread=False)
+    return _sqlite_conn
+
+
+def run_select_query(sql: str) -> pd.DataFrame:
+    """执行 SELECT 查询，复用长连接；断线时自动 ping 重连，失败则重建连接重试一次。"""
+    db_type = get_db_type()
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(2):
+        try:
+            if db_type == "mysql":
+                return _run_mysql_select(sql)
+            if db_type == "sqlite":
+                return _run_sqlite_select(sql)
+            raise RuntimeError(f"不支持的 DB_TYPE: {db_type}，可选值: sqlite / mysql")
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0 and _is_connection_error(exc):
+                reset_db_connection()
+                continue
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("SQL 执行失败")
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 9:
+        return True
+
+    try:
+        import pymysql
+    except ImportError:
+        return False
+
+    return isinstance(exc, (pymysql.Error, pymysql.OperationalError, pymysql.InterfaceError))
+
+
+def _run_mysql_select(sql: str) -> pd.DataFrame:
+    conn = _get_mysql_connection()
+    conn.ping(reconnect=True)
+
+    with conn.cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        return pd.DataFrame(rows, columns=columns)
+
+
+def _run_sqlite_select(sql: str) -> pd.DataFrame:
+    conn = _get_sqlite_connection()
+    return pd.read_sql_query(sql, conn)
 
 
 def connect_database(vn) -> None:
@@ -218,9 +330,9 @@ def extract_table_names_from_ddls(ddls: List[str]) -> List[str]:
 
 def list_trained_tables() -> dict:
     """查询已训练进 Vanna 向量库的表结构。"""
-    from services.vanna_service import create_vanna_instance
+    from services.vanna_service import get_vanna
 
-    vn = create_vanna_instance()
+    vn = get_vanna()
     training_data = vn.get_training_data()
 
     if training_data is None or training_data.empty:
