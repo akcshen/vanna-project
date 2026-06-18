@@ -13,6 +13,12 @@ from pydantic import BaseModel, Field
 
 from services.chart_query import handle_chart_ai_query, handle_chart_sql_query
 from services.database import list_connected_tables, list_trained_tables
+from services.ppt_template import (
+    delete_template,
+    get_template_detail,
+    list_templates,
+    save_template_with_id,
+)
 
 load_dotenv()
 
@@ -60,6 +66,16 @@ class ChartAIQueryRequest(BaseModel):
 class ChartSqlQueryRequest(BaseModel):
     sql: str = Field(..., description="用户输入的 SELECT SQL")
     chartType: str = Field(..., description="图表类型")
+
+
+class PPTTemplateSaveRequest(BaseModel):
+    id: Optional[str] = Field(None, description="模板 ID；传入时表示覆盖更新已有模板")
+    name: str = Field(..., description="模板名称，最长 50 字符")
+    data: dict = Field(..., description="演示文稿 JSON，与导出 JSON 结构一致")
+
+
+class PPTTemplateDeleteRequest(BaseModel):
+    id: str = Field(..., description="要删除的模板 ID")
 
 
 @app.exception_handler(Exception)
@@ -118,6 +134,30 @@ def chart_sql_query(body: ChartSqlQueryRequest):
         sql=body.sql,
         chart_type=body.chartType,
     )
+
+
+@app.get("/tools/ppt_templates")
+def ppt_templates():
+    """获取 PPT 模板列表（仅元信息）。"""
+    return list_templates()
+
+
+@app.post("/tools/ppt_template_save")
+def ppt_template_save(body: PPTTemplateSaveRequest):
+    """保存当前演示文稿为 PPT 模板。"""
+    return save_template_with_id(template_id=body.id, name=body.name, data=body.data)
+
+
+@app.get("/tools/ppt_template_detail")
+def ppt_template_detail(id: str):
+    """获取 PPT 模板详情（含完整演示文稿 JSON）。"""
+    return get_template_detail(template_id=id)
+
+
+@app.post("/tools/ppt_template_delete")
+def ppt_template_delete(body: PPTTemplateDeleteRequest):
+    """删除 PPT 模板。"""
+    return delete_template(template_id=body.id)
 
 
 if __name__ == "__main__":
