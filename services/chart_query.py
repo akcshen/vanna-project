@@ -1,4 +1,9 @@
-"""图表 AI 查询业务逻辑。"""
+"""图表 AI 查询业务逻辑。
+
+基准相关入口：handle_chart_ai_query(need_baseline=True)
+  → generate_and_run_bar_sql → dual_period_sql.build_bar_combined_sql
+详见 services/dual_period_sql.py 模块注释。
+"""
 
 import logging
 import re
@@ -21,6 +26,7 @@ def _parse_baseline_period(
     need_baseline: bool,
     baseline_period_raw: Optional[Dict[str, Any]],
 ) -> Optional[DatePeriod]:
+    """解析 baselinePeriod。仅 needBaseline=true 时必填，否则返回 None。"""
     if not need_baseline:
         return None
     if not baseline_period_raw:
@@ -72,7 +78,11 @@ def handle_chart_ai_query(
             need_baseline=need_baseline,
         )
 
+        # ── 查询分流 ──────────────────────────────────────────────
+        # needBaseline=true  → generate_and_run_bar_sql(data_period + baseline_period)
+        # needBaseline=false → generate_and_run_sql(仅 data_period，无基准列)
         if need_baseline:
+            # baseline_period 只传给 generate_and_run_bar_sql，用于基准期子查询 b
             sql, df = generate_and_run_bar_sql(
                 query,
                 data_period=data_period,
@@ -82,15 +92,16 @@ def handle_chart_ai_query(
             table_matrix = normalize_baseline_column_position(
                 dataframe_to_table_matrix(df, chart_type)
             )
+            # 返回的 sql 已是合并后的完整 SQL；tableMatrix 末列为「基准」
             payload = {
                 "state": 0,
                 "sql": sql,
                 "tableMatrix": table_matrix,
             }
         else:
+            # 单期查询：只需 data_period，不需要 baseline_period
             sql, df = generate_and_run_sql(
                 query,
-                date_period=data_period,
                 data_period=data_period,
                 stage="数据查询",
             )

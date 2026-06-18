@@ -1,4 +1,9 @@
-"""日期选择期校验与 SQL 过滤。"""
+"""日期选择期校验与 SQL 过滤。
+
+与基准相关的两个关键函数：
+  - apply_date_period_to_sql：把 dataPeriod / baselinePeriod 写入 SQL 的 WHERE
+  - normalize_base_sql_for_period_merge：合并基准前，清理 AI 在 SELECT 里写死的日期 CASE
+"""
 
 import os
 import re
@@ -73,40 +78,29 @@ def _format_period_label(period: DatePeriod) -> str:
     )
 
 
-def build_ai_question_with_periods(
+def build_ai_question_with_period(
     query: str,
-    active_period: Optional[DatePeriod] = None,
     data_period: Optional[DatePeriod] = None,
-    baseline_period: Optional[DatePeriod] = None,
 ) -> str:
-    """将数据日期与基准日期注入 AI 问题，便于生成带正确时间过滤的 SQL。"""
-    question = (query or "").strip()
-    if not question:
-        return question
+    """单期 AI 问题（配合 generate_and_run_sql，needBaseline=false）。
 
-    if active_period is None and data_period is None and baseline_period is None:
+    只注入 dataPeriod。双日期场景请用 build_bar_base_ai_question。
+    """
+    question = (query or "").strip()
+    if not question or data_period is None:
         return question
 
     date_column = _strip_column_backticks(get_date_column())
-    lines = [question]
-
-    period_lines: list[str] = []
-    if data_period is not None:
-        period_lines.append(f"数据日期范围：{_format_period_label(data_period)}")
-    if baseline_period is not None:
-        period_lines.append(f"基准日期范围：{_format_period_label(baseline_period)}")
-
-    if period_lines:
-        lines.append("时间选择期：" + "；".join(period_lines) + "。")
-
-    filter_period = active_period or data_period
-    if filter_period is not None:
-        lines.append(
-            f"请使用字段 `{date_column}` 过滤，"
-            f"仅统计 {filter_period.mysql_start()} 至 {filter_period.mysql_end()} 范围内的数据。"
-        )
-
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            question,
+            f"数据日期范围：{_format_period_label(data_period)}。",
+            (
+                f"请使用字段 `{date_column}` 过滤，"
+                f"仅统计 {data_period.mysql_start()} 至 {data_period.mysql_end()} 范围内的数据。"
+            ),
+        ]
+    )
 
 
 def build_bar_base_ai_question(
@@ -114,7 +108,11 @@ def build_bar_base_ai_question(
     data_period: DatePeriod,
     baseline_period: DatePeriod,
 ) -> str:
-    """柱形图单 SQL 模式：让 AI 生成不含具体日期范围的基础聚合 SQL。"""
+    """双期 AI 问题（配合 generate_and_run_bar_sql，needBaseline=true）。
+
+    同时告知 AI 数据期与基准期的范围，但只让 AI 生成不含具体日期的基础 SQL；
+    data_period / baseline_period 由后端分别注入子查询 d、b 的 WHERE。
+    """
     question = (query or "").strip()
     if not question:
         return question
@@ -137,7 +135,48 @@ def build_bar_base_ai_question(
     return "\n".join(lines)
 
 
+def normalize_base_sql_for_period_merge(base_sql: str) -> str:
+    """合并基准前的 SQL 清洗。
+
+    问题背景：AI 常生成
+      SUM(CASE WHEN stat_time >= '2025-10-10' THEN mileage ELSE 0 END)
+    若基准子查询的 WHERE 是 10-01~10-09，CASE 里仍要求 >= 10-10，
+    则基准期每一行聚合结果都是 0，最终「基准」列全为 0。
+
+    处理：把含 stat_time（DATE_COLUMN）的 CASE 还原成 SUM(mileage)，
+    日期范围只由 apply_date_period_to_sql 写入 WHERE。
+    """
+    date_col = _strip_column_backticks(get_date_column())
+    col_pattern = rf"(?:`{re.escape(date_col)}`|{re.escape(date_col)})"
+    cleaned = base_sql
+
+    round_case_pattern = re.compile(
+        rf"ROUND\s*\(\s*SUM\s*\(\s*CASE\s+WHEN\s+.*?{col_pattern}.*?"
+        rf"THEN\s+(.+?)\s+ELSE\s+(?:0|NULL)\s+END\s*\)\s*,\s*(\d+)\s*\)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    cleaned = round_case_pattern.sub(r"ROUND(SUM(\1), \2)", cleaned)
+
+    agg_case_pattern = re.compile(
+        rf"(SUM|AVG)\s*\(\s*CASE\s+WHEN\s+.*?{col_pattern}.*?"
+        rf"THEN\s+(.+?)\s+ELSE\s+(?:0|NULL)\s+END\s*\)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    while agg_case_pattern.search(cleaned):
+        cleaned = agg_case_pattern.sub(r"\1(\2)", cleaned)
+
+    return cleaned
+
+
 def apply_date_period_to_sql(sql: str, period: DatePeriod, date_column: Optional[str] = None) -> str:
+    """在 SQL 的 WHERE 中注入日期 BETWEEN 条件（DATE_COLUMN，默认 stat_time）。
+
+    用于把同一份基础 SQL 变成：
+      - 数据期子查询：BETWEEN dataPeriod.start AND dataPeriod.end
+      - 基准期子查询：BETWEEN baselinePeriod.start AND baselinePeriod.end
+
+    若原 SQL 为 `stat_time IS NOT NULL`，会替换为 BETWEEN，避免重复过滤。
+    """
     column = date_column or get_date_column()
     condition = (
         f"{column} BETWEEN '{period.mysql_start()}' AND '{period.mysql_end()}'"
@@ -153,10 +192,13 @@ def apply_date_period_to_sql(sql: str, period: DatePeriod, date_column: Optional
 
     head = cleaned[:insert_pos].rstrip()
     tail = cleaned[insert_pos:]
+    if tail and not tail.startswith((" ", "\n", "\t")):
+        tail = f" {tail.lstrip()}"
 
     if re.search(r"\bWHERE\b", head, re.IGNORECASE):
+        bare_col = _strip_column_backticks(column)
         is_null_pattern = re.compile(
-            rf"{re.escape(column)}\s+IS\s+NOT\s+NULL",
+            rf"`?{re.escape(bare_col)}`?\s+IS\s+NOT\s+NULL",
             re.IGNORECASE,
         )
         if is_null_pattern.search(head):

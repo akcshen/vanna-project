@@ -19,8 +19,9 @@ from services.dual_period_sql import build_bar_combined_sql
 from services.period import (
     DatePeriod,
     apply_date_period_to_sql,
-    build_ai_question_with_periods,
+    build_ai_question_with_period,
     build_bar_base_ai_question,
+    normalize_base_sql_for_period_merge,
 )
 from services.query_log import (
     ai_log_enabled,
@@ -232,19 +233,19 @@ def _try_get_trained_sql(vn: DeepSeekVanna, query: str) -> str:
 
 def generate_and_run_sql(
     query: str,
-    date_period: Optional[DatePeriod] = None,
     data_period: Optional[DatePeriod] = None,
-    baseline_period: Optional[DatePeriod] = None,
     stage: str = "SQL 查询",
 ) -> tuple[str, pd.DataFrame]:
+    """单期查询（needBaseline=false）。
+
+    只需 data_period：同时用于 AI 问题说明和 SQL 的 WHERE 日期过滤。
+
+    不含 baseline_period——基准逻辑在 generate_and_run_bar_sql 中处理，
+    该函数会同时使用 data_period 与 baseline_period 做 d JOIN b 合并。
+    """
     vn = get_vanna()
     trained_sql = _try_get_trained_sql(vn, query)
-    ai_question = build_ai_question_with_periods(
-        query,
-        active_period=date_period,
-        data_period=data_period or date_period,
-        baseline_period=baseline_period,
-    )
+    ai_question = build_ai_question_with_period(query, data_period)
 
     if trained_sql:
         raw_sql = trained_sql
@@ -255,8 +256,8 @@ def generate_and_run_sql(
 
     sql = validate_select_sql(raw_sql)
 
-    if date_period is not None:
-        sql = apply_date_period_to_sql(sql, date_period)
+    if data_period is not None:
+        sql = apply_date_period_to_sql(sql, data_period)
 
     try:
         df = run_select_query(sql)
@@ -265,7 +266,7 @@ def generate_and_run_sql(
             stage,
             source=source,
             query=query,
-            period=date_period,
+            period=data_period,
             sql=sql,
         )
         raise ValueError(f"SQL 执行失败: {exc} | SQL: {sql}") from exc
@@ -274,7 +275,7 @@ def generate_and_run_sql(
         stage,
         source=source,
         query=query if ai_question == query else ai_question,
-        period=date_period,
+        period=data_period,
         sql=sql,
         rows=len(df),
         columns=list(df.columns),
@@ -290,11 +291,23 @@ def generate_and_run_bar_sql(
     baseline_period: DatePeriod,
     stage: str = "合并查询（含基准）",
 ) -> tuple[str, pd.DataFrame]:
-    """生成基础 SQL 后合并为单条查询，同时返回主数据与基准列。"""
+    """带基准的合并查询（needBaseline=true）。
+
+    参数分工：
+      - data_period：数据期，注入子查询 d 的 WHERE，结果映射为 tableMatrix 主指标列
+      - baseline_period：基准期，注入子查询 b 的 WHERE，JOIN 后写入「基准」列
+
+    流程：
+    ① 用自然语言 query 让 AI（或训练缓存）生成基础 SQL
+    ② normalize_base_sql_for_period_merge 清洗 SELECT 中的日期 CASE
+    ③ build_bar_combined_sql 拼成 d JOIN b 的单条 SQL 并执行
+    ④ sanitize_baseline_dataframe 去掉多余的「基准总行驶里程」等列，只留「基准」
+    """
     vn = get_vanna()
     trained_sql = _try_get_trained_sql(vn, query)
     ai_question = build_bar_base_ai_question(query, data_period, baseline_period)
 
+    # ① 获取基础 SQL（只描述查什么、按什么分组，不含两个具体日期）
     if trained_sql:
         raw_sql = trained_sql
         source = "训练缓存"
@@ -302,7 +315,8 @@ def generate_and_run_bar_sql(
         source = "AI 生成"
         raw_sql = vn.generate_sql(ai_question, allow_llm_to_see_data=True)
 
-    base_sql = validate_select_sql(raw_sql)
+    # ② 清洗 + ③ 拼合并 SQL（内部会各注入 dataPeriod / baselinePeriod）
+    base_sql = normalize_base_sql_for_period_merge(validate_select_sql(raw_sql))
     combined_sql = build_bar_combined_sql(
         base_sql,
         data_period,
@@ -311,6 +325,7 @@ def generate_and_run_bar_sql(
 
     try:
         df = run_select_query(combined_sql)
+        # ④ 结果只保留：类别 + 主指标 + 最后一列「基准」
         df = sanitize_baseline_dataframe(df)
     except Exception as exc:
         log_sql_stage(
