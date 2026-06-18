@@ -1,14 +1,31 @@
 """图表 AI 查询业务逻辑。"""
 
+import logging
 import re
 from typing import Any, Dict, Optional
 
-from services.baseline import append_baseline_column
+from services.baseline import normalize_baseline_column_position
 from services.period import DatePeriod, parse_date_period
+from services.query_log import ai_log_enabled, log_request_start, log_section
 from services.table_matrix import dataframe_to_table_matrix
-from services.vanna_service import execute_sql, generate_and_run_sql
+from services.vanna_service import (
+    execute_sql,
+    generate_and_run_bar_sql,
+    generate_and_run_sql,
+)
 
-BAR_CHART_TYPES = {"bar"}
+logger = logging.getLogger("vanna.ai")
+
+
+def _parse_baseline_period(
+    need_baseline: bool,
+    baseline_period_raw: Optional[Dict[str, Any]],
+) -> Optional[DatePeriod]:
+    if not need_baseline:
+        return None
+    if not baseline_period_raw:
+        raise ValueError("needBaseline=true 时 baselinePeriod 不能为空")
+    return parse_date_period(baseline_period_raw, "baselinePeriod")
 
 
 def _extract_sql_from_message(message: str) -> str:
@@ -30,6 +47,7 @@ def _build_error_payload(exc: Exception) -> dict:
 def handle_chart_ai_query(
     query: str,
     chart_type: str,
+    need_baseline: bool = False,
     data_period_raw: Optional[Dict[str, Any]] = None,
     baseline_period_raw: Optional[Dict[str, Any]] = None,
 ) -> dict:
@@ -43,27 +61,58 @@ def handle_chart_ai_query(
 
     try:
         data_period = parse_date_period(data_period_raw, "dataPeriod")
-        baseline_period = parse_date_period(baseline_period_raw, "baselinePeriod")
+        baseline_period = _parse_baseline_period(need_baseline, baseline_period_raw)
 
-        sql, df = generate_and_run_sql(query, date_period=data_period)
-        table_matrix = dataframe_to_table_matrix(df, chart_type)
+        log_request_start(
+            "chart_ai_query",
+            query=query,
+            chart_type=chart_type,
+            data_period=data_period,
+            baseline_period=baseline_period,
+            need_baseline=need_baseline,
+        )
 
-        payload = {
-            "state": 0,
-            "sql": sql,
-            "tableMatrix": table_matrix,
-        }
-
-        if chart_type in BAR_CHART_TYPES:
-            baseline_sql, baseline_df = generate_and_run_sql(
+        if need_baseline:
+            sql, df = generate_and_run_bar_sql(
                 query,
-                date_period=baseline_period,
+                data_period=data_period,
+                baseline_period=baseline_period,
+                stage="合并查询（含基准）",
             )
-            payload["baselineSql"] = baseline_sql
-            payload["tableMatrix"] = append_baseline_column(table_matrix, baseline_df)
+            table_matrix = normalize_baseline_column_position(
+                dataframe_to_table_matrix(df, chart_type)
+            )
+            payload = {
+                "state": 0,
+                "sql": sql,
+                "tableMatrix": table_matrix,
+            }
+        else:
+            sql, df = generate_and_run_sql(
+                query,
+                date_period=data_period,
+                data_period=data_period,
+                stage="数据查询",
+            )
+            table_matrix = dataframe_to_table_matrix(df, chart_type)
+            payload = {
+                "state": 0,
+                "sql": sql,
+                "tableMatrix": table_matrix,
+            }
+
+        if ai_log_enabled():
+            rows = len(payload["tableMatrix"]) - 1
+            cols = len(payload["tableMatrix"][0]) if payload["tableMatrix"] else 0
+            lines = [f"state: 0", f"tableMatrix: {rows} 行 x {cols} 列"]
+            if need_baseline:
+                lines.append("单 SQL 已含基准列")
+            log_section("chart_ai_query 完成", lines)
 
         return payload
     except ValueError as exc:
+        if ai_log_enabled():
+            log_section("chart_ai_query 失败", [str(exc)], level=logging.WARNING)
         return _build_error_payload(exc)
     except RuntimeError as exc:
         return {"state": -1, "message": str(exc)}
@@ -87,8 +136,20 @@ def handle_chart_sql_query(
         return {"state": -1, "message": "chartType 不能为空"}
 
     try:
-        executed_sql, df = execute_sql(sql)
-        table_matrix = dataframe_to_table_matrix(df, chart_type)
+        log_request_start(
+            "chart_sql_query",
+            chart_type=chart_type,
+            sql=sql,
+        )
+        executed_sql, df = execute_sql(sql, stage="SQL 直查")
+        table_matrix = normalize_baseline_column_position(
+            dataframe_to_table_matrix(df, chart_type)
+        )
+
+        if ai_log_enabled():
+            rows = len(table_matrix) - 1
+            cols = len(table_matrix[0]) if table_matrix else 0
+            log_section("chart_sql_query 完成", [f"state: 0", f"tableMatrix: {rows} 行 x {cols} 列"])
 
         return {
             "state": 0,
@@ -96,6 +157,8 @@ def handle_chart_sql_query(
             "tableMatrix": table_matrix,
         }
     except ValueError as exc:
+        if ai_log_enabled():
+            log_section("chart_sql_query 失败", [str(exc)], level=logging.WARNING)
         return _build_error_payload(exc)
     except RuntimeError as exc:
         return {"state": -1, "message": str(exc)}

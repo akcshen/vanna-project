@@ -60,6 +60,83 @@ def parse_date_period(raw: Optional[Dict[str, Any]], field_name: str) -> DatePer
     return DatePeriod(start=start, end=end)
 
 
+def _strip_column_backticks(column: str) -> str:
+    if column.startswith("`") and column.endswith("`"):
+        return column[1:-1]
+    return column
+
+
+def _format_period_label(period: DatePeriod) -> str:
+    return (
+        f"{period.start} 至 {period.end}"
+        f"（{period.mysql_start()} 至 {period.mysql_end()}）"
+    )
+
+
+def build_ai_question_with_periods(
+    query: str,
+    active_period: Optional[DatePeriod] = None,
+    data_period: Optional[DatePeriod] = None,
+    baseline_period: Optional[DatePeriod] = None,
+) -> str:
+    """将数据日期与基准日期注入 AI 问题，便于生成带正确时间过滤的 SQL。"""
+    question = (query or "").strip()
+    if not question:
+        return question
+
+    if active_period is None and data_period is None and baseline_period is None:
+        return question
+
+    date_column = _strip_column_backticks(get_date_column())
+    lines = [question]
+
+    period_lines: list[str] = []
+    if data_period is not None:
+        period_lines.append(f"数据日期范围：{_format_period_label(data_period)}")
+    if baseline_period is not None:
+        period_lines.append(f"基准日期范围：{_format_period_label(baseline_period)}")
+
+    if period_lines:
+        lines.append("时间选择期：" + "；".join(period_lines) + "。")
+
+    filter_period = active_period or data_period
+    if filter_period is not None:
+        lines.append(
+            f"请使用字段 `{date_column}` 过滤，"
+            f"仅统计 {filter_period.mysql_start()} 至 {filter_period.mysql_end()} 范围内的数据。"
+        )
+
+    return "\n".join(lines)
+
+
+def build_bar_base_ai_question(
+    query: str,
+    data_period: DatePeriod,
+    baseline_period: DatePeriod,
+) -> str:
+    """柱形图单 SQL 模式：让 AI 生成不含具体日期范围的基础聚合 SQL。"""
+    question = (query or "").strip()
+    if not question:
+        return question
+
+    date_column = _strip_column_backticks(get_date_column())
+    lines = [
+        question,
+        (
+            "时间选择期："
+            f"数据日期范围：{_format_period_label(data_period)}；"
+            f"基准日期范围：{_format_period_label(baseline_period)}。"
+        ),
+        (
+            f"请生成按维度聚合的 SELECT（可用 `{date_column} IS NOT NULL`，"
+            "不要写死具体日期范围）。"
+            "只输出类别列和主数据数值列，不要生成「基准」或「基准」开头的列"
+            "（如基准总行驶里程），系统会自动合并标准「基准」列。"
+        ),
+    ]
+    return "\n".join(lines)
+
+
 def apply_date_period_to_sql(sql: str, period: DatePeriod, date_column: Optional[str] = None) -> str:
     column = date_column or get_date_column()
     condition = (
@@ -67,13 +144,12 @@ def apply_date_period_to_sql(sql: str, period: DatePeriod, date_column: Optional
     )
 
     cleaned = sql.strip().rstrip(";")
-    upper = cleaned.upper()
-
-    insert_pos = len(cleaned)
-    for keyword in (" GROUP BY ", " ORDER BY ", " HAVING ", " LIMIT "):
-        idx = upper.find(keyword)
-        if idx != -1 and idx < insert_pos:
-            insert_pos = idx
+    clause_match = re.search(
+        r"\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b",
+        cleaned,
+        re.IGNORECASE,
+    )
+    insert_pos = clause_match.start() if clause_match else len(cleaned)
 
     head = cleaned[:insert_pos].rstrip()
     tail = cleaned[insert_pos:]

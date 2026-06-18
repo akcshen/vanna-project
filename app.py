@@ -3,6 +3,7 @@
 import logging
 import os
 import traceback
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -19,9 +20,11 @@ log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    force=True,
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("vanna.ai").setLevel(getattr(logging, log_level, logging.INFO))
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(
     title="Chart AI Query API",
@@ -47,7 +50,11 @@ class ChartAIQueryRequest(BaseModel):
     query: str = Field(..., description="自然语言查询")
     chartType: str = Field(..., description="图表类型")
     dataPeriod: DatePeriodModel = Field(..., description="图表数据时间选择期")
-    baselinePeriod: DatePeriodModel = Field(..., description="基准数据时间选择期")
+    needBaseline: bool = Field(False, description="是否需要基准数据")
+    baselinePeriod: Optional[DatePeriodModel] = Field(
+        None,
+        description="基准数据时间选择期，needBaseline=true 时必填",
+    )
 
 
 class ChartSqlQueryRequest(BaseModel):
@@ -96,8 +103,11 @@ def chart_ai_query(body: ChartAIQueryRequest):
     return handle_chart_ai_query(
         query=body.query,
         chart_type=body.chartType,
+        need_baseline=body.needBaseline,
         data_period_raw=body.dataPeriod.model_dump(),
-        baseline_period_raw=body.baselinePeriod.model_dump(),
+        baseline_period_raw=(
+            body.baselinePeriod.model_dump() if body.baselinePeriod else None
+        ),
     )
 
 

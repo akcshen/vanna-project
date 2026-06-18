@@ -1,11 +1,10 @@
 """Vanna + DeepSeek 服务封装。"""
 
-import json
 import logging
 import os
 import re
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Optional
 
 import pandas as pd
 import sqlparse
@@ -14,24 +13,27 @@ from openai import OpenAI
 from vanna.legacy.chromadb import ChromaDB_VectorStore
 from vanna.legacy.openai.openai_chat import OpenAI_Chat
 
+from services.baseline import sanitize_baseline_dataframe
 from services.database import connect_database, get_sql_dialect, run_select_query
-from services.period import DatePeriod, apply_date_period_to_sql
+from services.dual_period_sql import build_bar_combined_sql
+from services.period import (
+    DatePeriod,
+    apply_date_period_to_sql,
+    build_ai_question_with_periods,
+    build_bar_base_ai_question,
+)
+from services.query_log import (
+    ai_log_enabled,
+    extract_categories,
+    log_ai_prompt,
+    log_ai_response,
+    log_sql_stage,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 logger = logging.getLogger("vanna.ai")
-
-
-def _ai_log_enabled() -> bool:
-    return _get_env("AI_LOG_ENABLED", "true").lower() in {"1", "true", "yes"}
-
-
-def _format_prompt_for_log(prompt: Any) -> str:
-    try:
-        return json.dumps(prompt, ensure_ascii=False, indent=2)
-    except TypeError:
-        return str(prompt)
 
 FORBIDDEN_SQL_KEYWORDS = {
     "INSERT",
@@ -60,33 +62,17 @@ class DeepSeekVanna(ChromaDB_VectorStore, OpenAI_Chat):
         OpenAI_Chat.__init__(self, client=client, config=config)
 
     def log(self, message: str, title: str = "Info"):
-        if _ai_log_enabled():
-            logger.info("[%s] %s", title, message)
-        else:
-            print(f"{title}: {message}")
+        if ai_log_enabled():
+            logger.debug("[%s] %s", title, message)
 
     def submit_prompt(self, prompt, **kwargs) -> str:
-        if _ai_log_enabled():
-            logger.info("=" * 60)
-            logger.info("[AI Prompt]\n%s", _format_prompt_for_log(prompt))
-
+        log_ai_prompt(prompt)
         content = OpenAI_Chat.submit_prompt(self, prompt, **kwargs)
-
-        if _ai_log_enabled():
-            logger.info("[AI 原始返回]\n%s", content)
-            logger.info("=" * 60)
-
+        log_ai_response(content)
         return content
 
     def generate_sql(self, question: str, **kwargs) -> str:
-        if _ai_log_enabled():
-            logger.info("[AI 生成 SQL] question=%s", question)
-
         sql = super().generate_sql(question, **kwargs)
-
-        if _ai_log_enabled():
-            logger.info("[AI 提取 SQL]\n%s", sql)
-
         return sql.replace("\\_", "_")
 
 
@@ -247,51 +233,125 @@ def _try_get_trained_sql(vn: DeepSeekVanna, query: str) -> str:
 def generate_and_run_sql(
     query: str,
     date_period: Optional[DatePeriod] = None,
+    data_period: Optional[DatePeriod] = None,
+    baseline_period: Optional[DatePeriod] = None,
+    stage: str = "SQL 查询",
 ) -> tuple[str, pd.DataFrame]:
     vn = get_vanna()
     trained_sql = _try_get_trained_sql(vn, query)
+    ai_question = build_ai_question_with_periods(
+        query,
+        active_period=date_period,
+        data_period=data_period or date_period,
+        baseline_period=baseline_period,
+    )
 
     if trained_sql:
         raw_sql = trained_sql
-        if _ai_log_enabled():
-            logger.info("[命中训练缓存] query=%s，跳过 AI 调用", query)
-            logger.info("[训练缓存 SQL]\n%s", raw_sql)
+        source = "训练缓存"
     else:
-        if _ai_log_enabled():
-            logger.info("[调用 AI] query=%s", query)
-        raw_sql = vn.generate_sql(query, allow_llm_to_see_data=True)
+        source = "AI 生成"
+        raw_sql = vn.generate_sql(ai_question, allow_llm_to_see_data=True)
 
     sql = validate_select_sql(raw_sql)
 
     if date_period is not None:
         sql = apply_date_period_to_sql(sql, date_period)
 
-    if _ai_log_enabled():
-        logger.info("[最终执行 SQL]\n%s", sql)
-
     try:
         df = run_select_query(sql)
     except Exception as exc:
+        log_sql_stage(
+            stage,
+            source=source,
+            query=query,
+            period=date_period,
+            sql=sql,
+        )
         raise ValueError(f"SQL 执行失败: {exc} | SQL: {sql}") from exc
 
-    if _ai_log_enabled():
-        logger.info("[查询结果] rows=%s, columns=%s", len(df), list(df.columns))
+    log_sql_stage(
+        stage,
+        source=source,
+        query=query if ai_question == query else ai_question,
+        period=date_period,
+        sql=sql,
+        rows=len(df),
+        columns=list(df.columns),
+        categories=extract_categories(df),
+    )
 
     return sql, df
 
 
-def execute_sql(sql: str) -> tuple[str, pd.DataFrame]:
-    validated_sql = validate_select_sql(sql)
+def generate_and_run_bar_sql(
+    query: str,
+    data_period: DatePeriod,
+    baseline_period: DatePeriod,
+    stage: str = "合并查询（含基准）",
+) -> tuple[str, pd.DataFrame]:
+    """生成基础 SQL 后合并为单条查询，同时返回主数据与基准列。"""
+    vn = get_vanna()
+    trained_sql = _try_get_trained_sql(vn, query)
+    ai_question = build_bar_base_ai_question(query, data_period, baseline_period)
 
-    if _ai_log_enabled():
-        logger.info("[直接执行 SQL]\n%s", validated_sql)
+    if trained_sql:
+        raw_sql = trained_sql
+        source = "训练缓存"
+    else:
+        source = "AI 生成"
+        raw_sql = vn.generate_sql(ai_question, allow_llm_to_see_data=True)
+
+    base_sql = validate_select_sql(raw_sql)
+    combined_sql = build_bar_combined_sql(
+        base_sql,
+        data_period,
+        baseline_period,
+    )
+
+    try:
+        df = run_select_query(combined_sql)
+        df = sanitize_baseline_dataframe(df)
+    except Exception as exc:
+        log_sql_stage(
+            stage,
+            source=source,
+            query=ai_question,
+            period=data_period,
+            sql=combined_sql,
+        )
+        raise ValueError(f"SQL 执行失败: {exc} | SQL: {combined_sql}") from exc
+
+    log_sql_stage(
+        stage,
+        source=source,
+        query=ai_question,
+        period=data_period,
+        sql=combined_sql,
+        rows=len(df),
+        columns=list(df.columns),
+        categories=extract_categories(df),
+    )
+
+    return combined_sql, df
+
+
+def execute_sql(sql: str, stage: str = "SQL 直查") -> tuple[str, pd.DataFrame]:
+    validated_sql = validate_select_sql(sql)
 
     try:
         df = run_select_query(validated_sql)
     except Exception as exc:
+        log_sql_stage(stage, source="用户输入", sql=validated_sql)
         raise ValueError(f"SQL 执行失败: {exc} | SQL: {validated_sql}") from exc
 
-    if _ai_log_enabled():
-        logger.info("[查询结果] rows=%s, columns=%s", len(df), list(df.columns))
+    log_sql_stage(
+        stage,
+        source="用户输入",
+        sql=validated_sql,
+        rows=len(df),
+        columns=list(df.columns),
+        categories=extract_categories(df),
+    )
 
     return validated_sql, df
