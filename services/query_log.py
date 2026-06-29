@@ -132,30 +132,6 @@ def log_ai_response(content: str) -> None:
         logger.info("AI 返回已收到（完整内容请设置 LOG_LEVEL=DEBUG）")
 
 
-def log_baseline_merge_error(
-    main_labels: list[str],
-    baseline_labels: list[str],
-    missing_label: str,
-) -> None:
-    if not ai_log_enabled():
-        return
-    main_set = set(main_labels)
-    baseline_set = set(baseline_labels)
-    missing = sorted(main_set - baseline_set)
-    extra = sorted(baseline_set - main_set)
-    log_section(
-        "基准列合并失败",
-        [
-            f"缺失类别: {missing_label}",
-            f"主数据类别({len(main_labels)}): {main_labels[:10]}{'...' if len(main_labels) > 10 else ''}",
-            f"基准类别({len(baseline_labels)}): {baseline_labels[:10]}{'...' if len(baseline_labels) > 10 else ''}",
-            f"主数据有、基准无: {missing[:10]}{'...' if len(missing) > 10 else ''}",
-            f"基准有、主数据无: {extra[:10]}{'...' if len(extra) > 10 else ''}",
-        ],
-        level=logging.WARNING,
-    )
-
-
 def extract_categories(df: pd.DataFrame) -> list[str]:
     if df is None or df.empty:
         return []

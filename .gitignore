@@ -3,7 +3,6 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
-data/sales.db
 data/ppt_templates.db
 data/*.db
 data/*.db-wal

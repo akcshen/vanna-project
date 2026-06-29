@@ -10,6 +10,7 @@
 - [本地开发部署](#本地开发部署)
 - [生产环境部署（Linux + systemd）](#生产环境部署linux--systemd)
 - [Docker 部署](#docker-部署)
+- [当前构建方式（test155）](#当前构建方式test155)
 - [首次训练与数据初始化](#首次训练与数据初始化)
 - [上线验证](#上线验证)
 - [前端联调](#前端联调)
@@ -37,7 +38,7 @@
 前端
   ↓ HTTP
 FastAPI (app.py, 默认 8080)
-  ├── MySQL / SQLite     ← 业务数据查询（DB_TYPE 配置）
+  ├── MySQL              ← 业务数据查询
   ├── data/chroma/       ← Vanna 向量库（AI 训练结果）
   └── data/ppt_templates.db ← PPT 模板（独立 SQLite）
        ↓
@@ -106,7 +107,6 @@ cp .env.example .env
 | `AI_LOG_ENABLED` | 业务日志 | `true` |
 | `CHROMA_PATH` | 向量库路径 | `./data/chroma` |
 | `PPT_TEMPLATE_DB_PATH` | PPT 模板库路径 | `./data/ppt_templates.db` |
-| `DATABASE_PATH` | SQLite 业务库（`DB_TYPE=sqlite`） | `./data/sales.db` |
 
 > `.env` 含敏感信息，**不要提交 Git**。
 
@@ -125,21 +125,15 @@ pip install -r requirements.txt
 
 ### 2. 配置 `.env`
 
-参考 [配置说明](#配置说明) 编辑 `.env`。
+参考 [配置说明](#配置说明) 编辑 `.env`（含 MySQL 连接与 `MYSQL_TABLES`）。
 
-### 3. 初始化数据（仅 SQLite 本地示例）
-
-```bash
-python scripts/init_db.py
-```
-
-### 4. 训练向量库
+### 3. 训练向量库
 
 ```bash
 python scripts/train.py
 ```
 
-### 5. 启动服务
+### 4. 启动服务
 
 ```bash
 source venv/bin/activate
@@ -341,12 +335,135 @@ curl http://127.0.0.1:8080/tools/database_tables
 
 适用于线上已有 Docker 的环境。项目已包含 `Dockerfile` 与 `docker-compose.yml`。
 
-> **线上环境说明（test155）**
-> - Docker `19.03.6`，使用 **`docker-compose`（v1）**，不是 `docker compose`
-> - 无法直接拉取 `python:3.11`，镜像使用 **`python:3.10-slim`**
-> - 构建代理：终端 `export HTTP_PROXY=...` 仅本次生效，或 `docker save/load` 传基础镜像
+---
 
-### 1. 拉基础镜像（按需）
+## 当前构建方式（test155）
+
+> 记录时间：2026-06。test155 上 **不在服务器 build**，由本机 Windows 构建完整镜像后离线传到线上。
+
+### 环境分工
+
+| 机器 | Docker | 角色 |
+|------|--------|------|
+| 本机 Windows（Git Bash + Docker Desktop） | 29.x + Compose 5.x | **构建镜像**、`docker save` 导出 |
+| test155 | 19.03.6 + docker-compose 1.18.0 | **只 load 镜像并运行**，宿主机 Python 2.7.5 不参与部署 |
+
+### 为什么不在 test155 上 build
+
+- test155 的 Docker `19.03.6` 过旧，无法在容器内正常执行 `apt-get`（Debian bookworm/trixie 会报 `Post-Invoke` / exit 100）。
+- 因此采用 **本机构建 → 导出 tar.gz → 线上 load** 的方式。
+
+### 镜像与产物
+
+| 产物 | 位置 / 名称 | 说明 |
+|------|-------------|------|
+| 构建后的镜像 | Docker 本地镜像库 | 标签 **`vanna-api:latest`**（不在项目目录里） |
+| 导出的离线包 | `dist/vanna-api-latest.tar.gz` | `docker save` 后用于 scp 到 test155 |
+| 项目代码包 | `dist/vanna-project-latest.tar.gz` | `./scripts/pack.sh` 生成，含 compose / `.env.example` 等 |
+
+查看本机镜像：
+
+```bash
+docker images vanna-api
+```
+
+### 本机构建（Windows）
+
+前置：本机代理（Clash 等）已启动，监听 `192.200.125.170:10808`（或确保构建容器能访问该地址）。
+
+`docker-compose.yml` 已**固定**构建代理为 `http://192.200.125.170:10808`（不会被 shell 里 `127.0.0.1:10808` 覆盖）。
+
+```bash
+cd vanna-project
+
+# 构建（基础镜像 python:3.10-slim-bookworm，见 Dockerfile）
+docker-compose build
+
+# 导出完整应用镜像（非仅 python 基础镜像）
+mkdir -p dist
+docker save vanna-api:latest | gzip > dist/vanna-api-latest.tar.gz
+
+# 打包项目文件（供 test155 上 docker-compose 使用）
+./scripts/pack.sh
+```
+
+上传到 test155：
+
+```bash
+scp dist/vanna-api-latest.tar.gz dist/vanna-project-latest.tar.gz nobd@test155:~/
+```
+
+**构建要点：**
+
+- `Dockerfile` 基础镜像：`python:3.10-slim-bookworm`（避免 `python:3.10-slim` 漂移到 trixie）。
+- 构建阶段 apt/pip 走代理；镜像 build 完成后 Dockerfile 会清空 `HTTP_PROXY`，**运行时**访问大模型 API 不走代理。
+- **不要把 `HTTP_PROXY` 写进 `.env`**。
+
+### test155 部署（只运行，不 build）
+
+```bash
+# 1. 导入应用镜像（首次或镜像更新时）
+gunzip -c ~/vanna-api-latest.tar.gz | docker load
+docker images | grep vanna-api
+
+# 2. 解压项目（首次或 compose / 脚本更新时）
+tar xzf vanna-project-latest.tar.gz
+cd vanna-project
+
+# 3. 配置（首次）
+cp .env.example .env
+vim .env    # MYSQL_HOST 填内网 IP，勿用 127.0.0.1
+mkdir -p data
+
+# 4. 启动（关键：--no-build）
+docker-compose up -d --no-build
+
+# 5. 首次训练向量库
+docker-compose exec vanna-api python scripts/train.py
+
+# 6. 验证
+curl http://127.0.0.1:8080/health
+docker-compose logs -f vanna-api
+```
+
+### 发版更新（当前流程）
+
+代码或依赖有变更时，在本机重新 build 并传镜像：
+
+```bash
+# 本机
+docker-compose build
+docker save vanna-api:latest | gzip > dist/vanna-api-latest.tar.gz
+./scripts/pack.sh
+scp dist/vanna-api-latest.tar.gz dist/vanna-project-latest.tar.gz nobd@test155:~/
+
+# test155
+gunzip -c ~/vanna-api-latest.tar.gz | docker load
+cd vanna-project && tar xzf ~/vanna-project-latest.tar.gz -C ..   # 或解压覆盖
+docker-compose down
+docker-compose up -d --no-build
+docker-compose exec vanna-api python scripts/train.py   # 仅表结构变更时
+```
+
+| 变更类型 | 是否需要重新 build + 传镜像 |
+|----------|----------------------------|
+| `requirements.txt` / `Dockerfile` | ✅ 需要 |
+| `app.py`、`services/*` 等业务代码 | ✅ 当前流程需要（见下方优化说明） |
+| 仅 `.env` | ❌ 改 `.env` 后 `docker-compose restart vanna-api` |
+
+> **后续可优化**：镜像只装 Python 依赖，代码目录挂载到容器，日常发版仅 `pack.sh` + scp + `restart`，无需每次传大镜像。当前尚未启用代码挂载。
+
+### test155 禁止 / 不推荐
+
+- ❌ 在 test155 执行 `docker-compose build`（会 apt 失败）
+- ❌ 使用宿主机 `python`（2.7.5）
+- ❌ 在 `.env` 中配置 `HTTP_PROXY`
+
+---
+
+### 1. 拉基础镜像（按需，旧流程 / 已不推荐单独使用）
+
+> 当前推荐直接传 **`vanna-api:latest` 完整镜像**。以下仅在使用旧版「服务器 build」流程时需要。
 
 **方式 A：本次终端代理（不改系统配置）**
 
@@ -384,9 +501,13 @@ vim .env
 - `MYSQL_HOST` 填容器可访问的 MySQL 内网 IP，**不要**写 `127.0.0.1`
 - 生产环境 `RELOAD=false`
 - **不要把 HTTP_PROXY 写进 `.env`**（会被 Python 应用加载，影响容器内 API 请求）
-- 构建代理通过终端 `export HTTP_PROXY=...` 传入，或依赖 `docker-compose.yml` 的 `build.args` 默认值
+- 构建代理由 `docker-compose.yml` 固定为 `http://192.200.125.170:10808`（本机 IP + 代理端口）
 
 ### 3. 构建并启动
+
+> **test155 请使用上文 [当前构建方式](#当前构建方式test155)**：`docker-compose up -d --no-build`。
+
+以下命令仅适用于 **能在本地正常 build 的机器**（非 test155）：
 
 ```bash
 cd vanna-project
@@ -429,9 +550,11 @@ docker-compose exec vanna-api python scripts/train.py   # 表结构变更时
 
 | 项目 | 说明 |
 |------|------|
-| 命令 | 使用 `docker-compose`，不是 `docker compose` |
-| 基础镜像 | `python:3.10-slim`（拉不到时改 `3.9-slim`） |
-| 代理 | 守护进程代理用于 `docker pull`；`docker-compose.yml` 的 `build.args` 用于构建时 apt/pip |
+| 命令 | test155 使用 `docker-compose`（v1），不是 `docker compose` |
+| 构建位置 | **本机 Windows** build；test155 **只 load + `--no-build`** |
+| 基础镜像 | `python:3.10-slim-bookworm`（Dockerfile 固定 bookworm） |
+| 应用镜像 | `vanna-api:latest`，离线包 `dist/vanna-api-latest.tar.gz` |
+| 代理 | 构建时 `docker-compose.yml` 固定 `http://192.200.125.170:10808`；运行时镜像内无代理 |
 | 数据卷 | 必须挂载 `./data:/app/data`，否则模板和向量库在重建容器后丢失 |
 | 单实例 | `ppt_templates.db` 为本地 SQLite，暂不支持多副本共享 |
 | 训练时机 | 首次部署或表结构变更后执行 `train.py`，不必每次启动都跑 |
@@ -441,7 +564,7 @@ docker-compose exec vanna-api python scripts/train.py   # 表结构变更时
 
 | 文件 | 作用 |
 |------|------|
-| `Dockerfile` | 基于 `python:3.10-slim`，支持 `HTTP_PROXY` 构建参数 |
+| `Dockerfile` | 基于 `python:3.10-slim-bookworm`；构建参数 `HTTP_PROXY`/`HTTPS_PROXY`；运行时清空代理 |
 | `docker-compose.yml` | `version: "3"`，兼容 docker-compose 1.18 |
 | `.dockerignore` | 排除 `venv/`、`.env`、`data/` 等，减小构建上下文 |
 
@@ -655,6 +778,31 @@ SQL 直查仅支持 `SELECT`，禁止 `INSERT/UPDATE/DELETE/DROP` 等。
 1. 修改 `.env` 中 MySQL 配置
 2. 执行 `python scripts/train.py`
 3. 重启服务
+
+### 8. 容器反复重启，`OpenBLAS pthread_create failed`
+
+- **原因**：test155 上 Docker 19.03 的 seccomp 限制，numpy/pandas 默认多线程会报 `Operation not permitted`。
+- **处理**（test155 需两项同时配置）：
+  1. `OPENBLAS_NUM_THREADS=1`、`OMP_NUM_THREADS=1` 等环境变量
+  2. `security_opt: ["seccomp:unconfined"]`（Docker 19.03 常见必需）
+
+更新 `docker-compose.yml` 后 **无需 rebuild 镜像**：
+
+```bash
+grep -E 'OPENBLAS|seccomp' docker-compose.yml   # 确认已包含
+docker-compose down
+docker-compose up -d --no-build
+docker-compose logs --tail=30 vanna-api
+docker-compose exec vanna-api python scripts/train.py
+```
+
+- 快速验证（不启动服务）：
+
+```bash
+docker run --rm --security-opt seccomp=unconfined \
+  -e OPENBLAS_NUM_THREADS=1 vanna-api:latest \
+  python -c "import pandas; print('ok')"
+```
 
 ---
 

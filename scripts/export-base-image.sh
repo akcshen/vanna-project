@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE="${BASE_IMAGE:-python:3.10-slim}"
+IMAGE="${BASE_IMAGE:-python:3.10-slim-bookworm}"
 DIST_DIR="${ROOT_DIR}/dist"
 ARCHIVE="${DIST_DIR}/python-3.10-slim.tar.gz"
 

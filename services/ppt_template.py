@@ -7,16 +7,17 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-MAX_NAME_LENGTH = 50
+from services.config import BASE_DIR, get_env
 
 
 def _get_db_path() -> str:
-    return os.getenv(
+    return get_env(
         "PPT_TEMPLATE_DB_PATH",
         os.path.join(BASE_DIR, "data", "ppt_templates.db"),
-    ).strip()
+    )
+
+
+MAX_NAME_LENGTH = 50
 
 
 def _now_str() -> str:

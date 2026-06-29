@@ -47,26 +47,24 @@ def _get_result_columns(sql: str) -> list[str]:
 
 
 def _resolve_baseline_value_column(
-    baseline_sql: str,
+    columns: list[str],
     data_metric_cols: list[str],
 ) -> str:
     """决定 JOIN 后「基准」列从基准子查询的哪一列取值。
 
+    数据期与基准期来自同一份 base_sql，列结构一致，无需二次预览查询。
+
     优先级：
       1. 列名以「基准」开头（如 基准总行驶里程）——AI 若多生成了这类列，优先用它
-      2. 否则用基准子查询的第一个主数据数值列（与 d 侧指标同名，如 总行驶里程）
+      2. 否则用第一个主数据数值列（与 d 侧指标同名，如 总行驶里程）
     """
-    baseline_columns = _get_result_columns(baseline_sql)
-    for col in baseline_columns[1:]:
+    for col in columns[1:]:
         if is_redundant_baseline_column(col):
             return col
 
-    baseline_metrics = filter_data_metric_columns(baseline_columns)
-    if baseline_metrics:
-        return baseline_metrics[0]
     if data_metric_cols:
         return data_metric_cols[0]
-    raise ValueError("无法从基准子查询中解析数值列")
+    raise ValueError("无法从子查询中解析数值列")
 
 
 def build_bar_combined_sql(
@@ -87,7 +85,7 @@ def build_bar_combined_sql(
     metric_cols = filter_data_metric_columns(columns)  # 主数据数值列，排除 AI 多余的「基准*」列
     if not metric_cols:
         raise ValueError("合并查询至少需要 1 列主数据数值指标")
-    baseline_value_col = _resolve_baseline_value_column(baseline_sql, metric_cols)
+    baseline_value_col = _resolve_baseline_value_column(columns, metric_cols)
 
     label = _quote_ident(label_col)
     select_parts = [

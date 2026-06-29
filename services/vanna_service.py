@@ -8,12 +8,12 @@ from typing import Optional
 
 import pandas as pd
 import sqlparse
-from dotenv import load_dotenv
 from openai import OpenAI
 from vanna.legacy.chromadb import ChromaDB_VectorStore
 from vanna.legacy.openai.openai_chat import OpenAI_Chat
 
 from services.baseline import sanitize_baseline_dataframe
+from services.config import BASE_DIR, get_env
 from services.database import connect_database, get_sql_dialect, run_select_query
 from services.dual_period_sql import build_bar_combined_sql
 from services.period import (
@@ -30,9 +30,6 @@ from services.query_log import (
     log_ai_response,
     log_sql_stage,
 )
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 logger = logging.getLogger("vanna.ai")
 
@@ -53,8 +50,6 @@ FORBIDDEN_SQL_KEYWORDS = {
     "ATTACH",
     "DETACH",
 }
-
-SQLITE_ONLY_KEYWORDS = {"PRAGMA"}
 
 
 class DeepSeekVanna(ChromaDB_VectorStore, OpenAI_Chat):
@@ -77,10 +72,6 @@ class DeepSeekVanna(ChromaDB_VectorStore, OpenAI_Chat):
         return sql.replace("\\_", "_")
 
 
-def _get_env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
 def _normalize_base_url(url: str) -> str:
     """规范化模型 API 地址，兼容带/不带 /v1 后缀。"""
     normalized = url.strip().rstrip("/")
@@ -100,17 +91,17 @@ def _build_initial_prompt() -> str:
 
 
 def create_vanna_instance() -> DeepSeekVanna:
-    api_key = _get_env("DEEPSEEK_API_KEY")
+    api_key = get_env("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("未配置 DEEPSEEK_API_KEY，请在 .env 中设置")
 
-    chroma_path = _get_env("CHROMA_PATH", os.path.join(BASE_DIR, "data", "chroma"))
+    chroma_path = get_env("CHROMA_PATH", os.path.join(BASE_DIR, "data", "chroma"))
     os.makedirs(chroma_path, exist_ok=True)
 
     base_url = _normalize_base_url(
-        _get_env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        get_env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     )
-    model = _get_env("DEEPSEEK_MODEL", "deepseek-chat")
+    model = get_env("DEEPSEEK_MODEL", "deepseek-chat")
 
     client = OpenAI(api_key=api_key, base_url=base_url)
 
@@ -196,9 +187,6 @@ def validate_select_sql(sql: str) -> str:
         raise ValueError(f"仅允许执行 SELECT 查询，当前生成: {preview}")
 
     forbidden = set(FORBIDDEN_SQL_KEYWORDS)
-    if get_sql_dialect() == "SQLite":
-        forbidden |= SQLITE_ONLY_KEYWORDS
-
     upper_sql = cleaned.upper()
     for keyword in forbidden:
         if re.search(rf"\b{keyword}\b", upper_sql):

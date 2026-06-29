@@ -5,8 +5,8 @@ services:
     build:
       context: .
       args:
-        HTTP_PROXY: ${HTTP_PROXY:-http://192.200.125.170:10808}
-        HTTPS_PROXY: ${HTTPS_PROXY:-http://192.200.125.170:10808}
+        HTTP_PROXY: http://192.200.125.170:10808
+        HTTPS_PROXY: http://192.200.125.170:10808
         NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     image: vanna-api:latest
     container_name: vanna-api
@@ -19,5 +19,13 @@ services:
       - RELOAD=false
       - CHROMA_PATH=/app/data/chroma
       - PPT_TEMPLATE_DB_PATH=/app/data/ppt_templates.db
+      # Docker 19.x + 旧 seccomp 下 numpy/OpenBLAS 多线程会 pthread_create failed
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+    # Docker 19.03 seccomp 过严，仅限制线程数仍可能失败
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - ./data:/app/data

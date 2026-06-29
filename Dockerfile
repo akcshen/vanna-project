@@ -1,5 +1,5 @@
-# 线上环境若拉不到 3.11，使用 3.10-slim；构建时需配置 HTTP 代理
-FROM python:3.10-slim
+# 固定 bookworm，避免 python:3.10-slim 随 Debian stable 漂移到 trixie（旧 Docker 会 apt 失败）
+FROM python:3.10-slim-bookworm
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
@@ -11,8 +11,9 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -30,7 +31,11 @@ ENV HTTP_PROXY= \
 ENV HOST=0.0.0.0 \
     PORT=8080 \
     RELOAD=false \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
 
 EXPOSE 8080
 

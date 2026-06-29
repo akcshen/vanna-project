@@ -5,12 +5,12 @@ import os
 import traceback
 from typing import Optional
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+import services.config  # noqa: F401 — 加载 .env
 from services.chart_query import handle_chart_ai_query, handle_chart_sql_query
 from services.database import list_connected_tables, list_trained_tables
 from services.ppt_template import (
@@ -19,8 +19,6 @@ from services.ppt_template import (
     list_templates,
     save_template_with_id,
 )
-
-load_dotenv()
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(

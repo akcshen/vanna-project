@@ -7,11 +7,9 @@ import sys
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
-from dotenv import load_dotenv
+import services.config  # noqa: F401 — 加载 .env
 
 from services.database import list_connected_tables, list_trained_tables
-
-load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 
 def main() -> None:

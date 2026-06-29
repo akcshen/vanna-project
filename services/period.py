@@ -5,19 +5,16 @@
   - normalize_base_sql_for_period_merge：合并基准前，清理 AI 在 SELECT 里写死的日期 CASE
 """
 
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-
-def _get_env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+from services.config import get_env
 
 
 def get_date_column() -> str:
-    column = _get_env("DATE_COLUMN", "销售日期")
+    column = get_env("DATE_COLUMN", "stat_time")
     if column.startswith("`") and column.endswith("`"):
         return column
     return f"`{column}`"

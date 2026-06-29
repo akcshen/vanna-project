@@ -1,33 +1,30 @@
-"""数据库连接与 schema 获取。"""
+"""MySQL 数据库连接与 schema 获取。"""
 
-import os
 import re
-import sqlite3
 from typing import List, Optional
 
 import pandas as pd
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _get_env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+from services.config import get_env
 
 
 def get_db_type() -> str:
-    return _get_env("DB_TYPE", "sqlite").lower()
+    db_type = get_env("DB_TYPE", "mysql").lower()
+    if db_type != "mysql":
+        raise RuntimeError(f"不支持的 DB_TYPE: {db_type}，当前仅支持 mysql")
+    return db_type
 
 
 def get_sql_dialect() -> str:
-    return "MySQL" if get_db_type() == "mysql" else "SQLite"
+    return "MySQL"
 
 
 def get_mysql_config() -> dict:
-    host = _get_env("MYSQL_HOST")
-    port = _get_env("MYSQL_PORT", "3306")
-    user = _get_env("MYSQL_USER")
-    password = _get_env("MYSQL_PASSWORD")
-    database = _get_env("MYSQL_DATABASE")
+    host = get_env("MYSQL_HOST")
+    port = get_env("MYSQL_PORT", "3306")
+    user = get_env("MYSQL_USER")
+    password = get_env("MYSQL_PASSWORD")
+    database = get_env("MYSQL_DATABASE")
 
     missing = [
         key
@@ -51,24 +48,19 @@ def get_mysql_config() -> dict:
     }
 
 
-def get_sqlite_path() -> str:
-    return _get_env("DATABASE_PATH", os.path.join(BASE_DIR, "data", "sales.db"))
-
-
 def get_mysql_tables_filter() -> Optional[List[str]]:
-    raw = _get_env("MYSQL_TABLES")
+    raw = get_env("MYSQL_TABLES")
     if not raw:
         return None
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 _mysql_conn = None
-_sqlite_conn = None
 
 
 def reset_db_connection() -> None:
     """关闭并清空缓存的数据库连接，下次查询时自动重建。"""
-    global _mysql_conn, _sqlite_conn
+    global _mysql_conn
 
     if _mysql_conn is not None:
         try:
@@ -76,13 +68,6 @@ def reset_db_connection() -> None:
         except Exception:
             pass
         _mysql_conn = None
-
-    if _sqlite_conn is not None:
-        try:
-            _sqlite_conn.close()
-        except Exception:
-            pass
-        _sqlite_conn = None
 
 
 def _create_mysql_connection():
@@ -113,25 +98,14 @@ def _get_mysql_connection():
     return _mysql_conn
 
 
-def _get_sqlite_connection():
-    global _sqlite_conn
-    if _sqlite_conn is None:
-        _sqlite_conn = sqlite3.connect(get_sqlite_path(), check_same_thread=False)
-    return _sqlite_conn
-
-
 def run_select_query(sql: str) -> pd.DataFrame:
     """执行 SELECT 查询，复用长连接；断线时自动 ping 重连，失败则重建连接重试一次。"""
-    db_type = get_db_type()
+    get_db_type()
     last_exc: Optional[Exception] = None
 
     for attempt in range(2):
         try:
-            if db_type == "mysql":
-                return _run_mysql_select(sql)
-            if db_type == "sqlite":
-                return _run_sqlite_select(sql)
-            raise RuntimeError(f"不支持的 DB_TYPE: {db_type}，可选值: sqlite / mysql")
+            return _run_mysql_select(sql)
         except Exception as exc:
             last_exc = exc
             if attempt == 0 and _is_connection_error(exc):
@@ -167,34 +141,17 @@ def _run_mysql_select(sql: str) -> pd.DataFrame:
         return pd.DataFrame(rows, columns=columns)
 
 
-def _run_sqlite_select(sql: str) -> pd.DataFrame:
-    conn = _get_sqlite_connection()
-    return pd.read_sql_query(sql, conn)
-
-
 def connect_database(vn) -> None:
-    db_type = get_db_type()
-
-    if db_type == "mysql":
-        cfg = get_mysql_config()
-        vn.connect_to_mysql(
-            host=cfg["host"],
-            dbname=cfg["database"],
-            user=cfg["user"],
-            password=cfg["password"],
-            port=cfg["port"],
-        )
-        vn.dialect = "MySQL"
-        return
-
-    if db_type == "sqlite":
-        database_path = get_sqlite_path()
-        os.makedirs(os.path.dirname(database_path), exist_ok=True)
-        vn.connect_to_sqlite(database_path)
-        vn.dialect = "SQLite"
-        return
-
-    raise RuntimeError(f"不支持的 DB_TYPE: {db_type}，可选值: sqlite / mysql")
+    get_db_type()
+    cfg = get_mysql_config()
+    vn.connect_to_mysql(
+        host=cfg["host"],
+        dbname=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+        port=cfg["port"],
+    )
+    vn.dialect = "MySQL"
 
 
 def fetch_mysql_ddls() -> List[str]:
@@ -269,48 +226,19 @@ def list_mysql_tables() -> List[str]:
     return tables
 
 
-def list_sqlite_tables() -> List[str]:
-    database_path = get_sqlite_path()
-    if not os.path.exists(database_path):
-        return []
-
-    conn = sqlite3.connect(database_path)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        )
-        return [row[0] for row in cursor.fetchall()]
-    finally:
-        conn.close()
-
-
 def list_connected_tables() -> dict:
-    """查询当前数据库连接可访问的表。"""
-    db_type = get_db_type()
-
-    if db_type == "mysql":
-        cfg = get_mysql_config()
-        tables = list_mysql_tables()
-        return {
-            "dbType": "mysql",
-            "database": cfg["database"],
-            "host": cfg["host"],
-            "port": cfg["port"],
-            "tables": tables,
-            "count": len(tables),
-        }
-
-    if db_type == "sqlite":
-        tables = list_sqlite_tables()
-        return {
-            "dbType": "sqlite",
-            "database": get_sqlite_path(),
-            "tables": tables,
-            "count": len(tables),
-        }
-
-    raise RuntimeError(f"不支持的 DB_TYPE: {db_type}")
+    """查询当前 MySQL 连接可访问的表。"""
+    get_db_type()
+    cfg = get_mysql_config()
+    tables = list_mysql_tables()
+    return {
+        "dbType": "mysql",
+        "database": cfg["database"],
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "tables": tables,
+        "count": len(tables),
+    }
 
 
 def extract_table_names_from_ddls(ddls: List[str]) -> List[str]:
