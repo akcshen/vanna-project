@@ -1,0 +1,23 @@
+version: "3"
+
+services:
+  vanna-api:
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-http://192.200.125.170:10808}
+        HTTPS_PROXY: ${HTTPS_PROXY:-http://192.200.125.170:10808}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+    image: vanna-api:latest
+    container_name: vanna-api
+    restart: always
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - RELOAD=false
+      - CHROMA_PATH=/app/data/chroma
+      - PPT_TEMPLATE_DB_PATH=/app/data/ppt_templates.db
+    volumes:
+      - ./data:/app/data
