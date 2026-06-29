@@ -11,4 +11,4 @@ data/*.db-shm
 data/chroma/
 .DS_Store
 dist/
-.codegraph
+.codegraph/
